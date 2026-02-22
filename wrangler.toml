@@ -1,0 +1,7 @@
+name = "obsidian-redirect"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+routes = [
+  { pattern = "obs.gisk0.dev/*", zone_name = "gisk0.dev" }
+]
