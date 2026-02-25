@@ -1,39 +1,69 @@
 # obsidian-redirect
 
-HTTPS → `obsidian://` redirect service for Telegram deep links.
+HTTPS → `obsidian://` redirect service. Deploy on Cloudflare Workers to make Obsidian vault links clickable in Telegram, Discord, Slack, and any chat app that only hyperlinks `http(s)://` URLs.
 
-**Problem:** Telegram only hyperlinks `http://` and `https://` URLs — `obsidian://` URIs render as plain unclickable text. Worse, Telegram's iOS in-app browser (WKWebView) blocks script-initiated navigation to custom URI schemes, so a raw server-side 302 redirect silently fails.
+## Quick Start
 
-**Solution:** Serve an HTML page at `obs.gisk0.dev` with a visible **"Open in Obsidian →"** button as the primary path (user-initiated tap passes WKWebView security checks), plus a JS redirect as a bonus for macOS desktop browsers.
+Get your own instance running in ~5 minutes:
 
-## URL Formats
+1. **Fork** [gisk0/obsidian-redirect](https://github.com/gisk0/obsidian-redirect)
 
-### Shorthand (recommended for Giskard-generated links)
+2. **Configure your domain** — edit `wrangler.toml`:
+   ```toml
+   routes = [
+     { pattern = "obs.yourdomain.com/*", zone_name = "yourdomain.com" }
+   ]
+   ```
+
+3. **Deploy:**
+   ```bash
+   npm install
+   npx wrangler login        # authenticate with Cloudflare
+   npm run deploy
+   ```
+
+4. **Verify:**
+   ```bash
+   curl https://obs.yourdomain.com/health   # → 200 "ok"
+   ```
+
+### CI/CD (optional)
+
+After the first manual deploy, pushes to `main` auto-deploy via GitHub Actions.
+
+Add one GitHub secret: **`CF_API_TOKEN`**
+- Create at [Cloudflare → Profile → API Tokens](https://dash.cloudflare.com/profile/api-tokens)
+- Template: **Edit Cloudflare Workers**
+- Scope: Account → Workers Scripts → Edit
+
+## Usage
+
+### URL format
 
 ```
-https://obs.gisk0.dev/<VaultName>/<file-path>
+https://obs.yourdomain.com/<VaultName>/<encoded-file-path>
 ```
 
-- Slashes in the file path must be encoded as `%2F`
-- Omit the `.md` extension (Obsidian resolves it automatically)
+- Encode `/` in the file path as `%2F`
+- Omit the `.md` extension (Obsidian resolves it)
 
 **Examples:**
 
 ```
-https://obs.gisk0.dev/Giskard/projects%2Fobsidian-redirect%2Fplan
-https://obs.gisk0.dev/Giskard/artifacts%2F2026-02-22-report%2Fanalysis
+https://obs.yourdomain.com/MyVault/projects%2Fmy-project%2Fplan
+https://obs.yourdomain.com/MyVault/notes%2F2026-02-22-meeting
 ```
 
-Markdown link syntax for Telegram messages:
+### Markdown syntax (for chat apps)
 
 ```markdown
-[📄 plan](https://obs.gisk0.dev/Giskard/projects%2Fobsidian-redirect%2Fplan)
+[📄 plan](https://obs.yourdomain.com/MyVault/projects%2Fmy-project%2Fplan)
 ```
 
-### Passthrough (arbitrary vault/action)
+### Passthrough (arbitrary parameters)
 
 ```
-https://obs.gisk0.dev/open?vault=Giskard&file=projects%2Ffoo%2Fbar
+https://obs.yourdomain.com/open?vault=MyVault&file=path%2Fto%2Fnote
 ```
 
 Parameters are forwarded verbatim to `obsidian://open?...`.
@@ -41,64 +71,47 @@ Parameters are forwarded verbatim to `obsidian://open?...`.
 ### Health check
 
 ```
-https://obs.gisk0.dev/health  →  200 "ok"
+GET /health  →  200 "ok"
 ```
 
-## UX
+## How It Works
+
+**The problem:** Chat apps like Telegram only hyperlink `http://` and `https://` URLs — `obsidian://` URIs render as plain text. Worse, Telegram's iOS in-app browser (WKWebView) blocks script-initiated navigation to custom URI schemes, so even a server-side 302 redirect silently fails on iOS.
+
+**The solution:** A Cloudflare Worker serves an HTML page with:
+
+- A **"Open in Obsidian →" button** — user-initiated taps pass WKWebView's security checks (iOS)
+- A **JS auto-redirect** — fires immediately on macOS/desktop browsers for zero-friction UX
 
 | Platform | Experience |
 |---|---|
-| **macOS Telegram** | Tap link → browser flashes → Obsidian opens (~0 friction, sub-second) |
-| **iOS Telegram** | Tap link → see "Open in Obsidian" page → tap button → Obsidian opens (1 extra tap, unavoidable) |
+| **macOS** | Click link → browser flashes → Obsidian opens instantly |
+| **iOS** | Tap link → see "Open in Obsidian" page → tap button → Obsidian opens |
 
-The 1-extra-tap on iOS is a hard limit — Telegram WKWebView blocks script-initiated navigation to custom URI schemes. The button approach is the most reliable technique available without Universal Links (which Obsidian doesn't implement).
+The extra tap on iOS is unavoidable — it's a WKWebView security constraint. The button approach is the most reliable method available (Obsidian doesn't support Universal Links).
 
-## iOS Shortcut (power user, 100% reliable)
+## Configuration
 
-One-time setup eliminates the HTML page entirely on iOS:
+### `wrangler.toml`
 
-1. Open **Shortcuts** app → New Shortcut
-2. Add action: **Receive** → "URLs" (from Share Sheet)
-3. Add action: **Replace Text** in `Shortcut Input`
-   - Find: `https://obs.gisk0.dev/`
-   - Replace: `obsidian://open?`
-4. Add action: **Open URLs** (the result)
-5. Name it "Open in Obsidian" and enable **Show in Share Sheet**
+```toml
+name = "obsidian-redirect"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
 
-Usage: tap link → tap "..." menu → Share → "Open in Obsidian" → Obsidian opens directly.
-
-## Deploy
-
-### First-time setup
-
-```bash
-# 1. Install dependencies
-npm install
-
-# 2. Authenticate with Cloudflare (opens browser, use gisk0 account)
-npx wrangler login
-
-# 3. Deploy
-npm run deploy
-
-# 4. Verify
-curl https://obs.gisk0.dev/health
-curl -v https://obs.gisk0.dev/Giskard/test
+routes = [
+  { pattern = "obs.yourdomain.com/*", zone_name = "yourdomain.com" }
+]
 ```
 
-### CI/CD (GitHub Actions)
+The Workers Route automatically creates the necessary DNS records — no manual DNS configuration needed.
 
-After first manual deploy, subsequent deploys happen automatically on push to `main`.
+### Custom domain requirements
 
-**Required GitHub secret:**
+- Domain must be on Cloudflare (proxied through their nameservers)
+- The `zone_name` must match your Cloudflare zone
 
-1. Go to repo **Settings → Secrets and variables → Actions**
-2. Add secret: `CF_API_TOKEN`
-   - Create token at: [Cloudflare Dashboard → Profile → API Tokens](https://dash.cloudflare.com/profile/api-tokens)
-   - Template: **Edit Cloudflare Workers**
-   - Scope: Account → Workers Scripts → Edit
-
-### Local development
+## Local Development
 
 ```bash
 npm run dev   # starts wrangler dev server at http://localhost:8787
@@ -106,7 +119,7 @@ npm run dev   # starts wrangler dev server at http://localhost:8787
 
 ## Architecture
 
-- **Runtime:** Cloudflare Workers (TypeScript, `wrangler.toml`)
-- **Route:** `obs.gisk0.dev/*` via Workers Routes (no manual DNS records needed)
-- **Security:** No auth, no state, no DB. Constructs only `obsidian://open?vault=...&file=...`. XSS-safe: obsidianUrl is `JSON.stringify`'d in the script tag, never raw-interpolated into executable context.
+- **Runtime:** Cloudflare Workers (TypeScript)
 - **Code:** `src/index.ts` — ~50 lines
+- **Security:** No auth, no state, no database. Constructs only `obsidian://open?vault=...&file=...` URLs. XSS-safe via `JSON.stringify` escaping.
+- **Routing:** Workers Routes (subdomain pattern → Worker)
