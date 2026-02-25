@@ -117,20 +117,6 @@ The Workers Route automatically creates the necessary DNS records — no manual 
 npm run dev   # starts wrangler dev server at http://localhost:8787
 ```
 
-## iOS Shortcut (Power User Tip)
-
-Bypass the HTML page entirely on iOS with a one-time Shortcuts setup:
-
-1. **Shortcuts** app → New Shortcut
-2. Add action: **Receive** → "URLs" (from Share Sheet)
-3. Add action: **Replace Text** in `Shortcut Input`
-   - Find: `https://obs.yourdomain.com/`
-   - Replace: `obsidian://open?`
-4. Add action: **Open URLs**
-5. Name it "Open in Obsidian", enable **Show in Share Sheet**
-
-Then: tap link → share menu → "Open in Obsidian" → Obsidian opens directly. Zero extra pages.
-
 ## Architecture
 
 - **Runtime:** Cloudflare Workers (TypeScript)
