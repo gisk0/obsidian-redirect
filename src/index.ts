@@ -1,4 +1,281 @@
-const HTML = (obsidianUrl: string) => `<!DOCTYPE html>
+import { marked } from "marked";
+
+export interface Env {
+  PUBLISHED_NOTES: KVNamespace;
+  PUBLISH_TOKEN: string;
+}
+
+interface NoteRecord {
+  title: string;
+  markdown: string;
+  publishedAt: string;
+  updatedAt: string;
+}
+
+interface NoteMetaEntry {
+  slug: string;
+  title: string;
+  publishedAt: string;
+  updatedAt: string;
+}
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const MAX_BODY_SIZE = 1024 * 1024; // 1 MB
+const MAX_MARKDOWN_SIZE = 512 * 1024; // 512 KB
+const MAX_TITLE_SIZE = 1024; // 1 KB
+const SLUG_RE = /^[a-z0-9][a-z0-9-]*$/;
+const META_INDEX_KEY = "_meta:index";
+
+// ─── CSS ──────────────────────────────────────────────────────────────────────
+
+const CSS = `
+  *, *::before, *::after { box-sizing: border-box; }
+  html { font-size: 18px; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Georgia, serif;
+    background: #fafaf9;
+    color: #1c1c1c;
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 2rem 1.5rem 4rem;
+    line-height: 1.75;
+  }
+  header { margin-bottom: 2.5rem; border-bottom: 1px solid #e5e5e5; padding-bottom: 1.5rem; }
+  header h1 { font-size: 2rem; font-weight: 700; margin: 0 0 0.4rem; line-height: 1.25; }
+  header .meta { color: #6b6b6b; font-size: 0.875rem; }
+  article h1, article h2, article h3, article h4, article h5, article h6 {
+    margin: 1.8rem 0 0.6rem; font-weight: 600; line-height: 1.3;
+  }
+  article h1 { font-size: 1.75rem; }
+  article h2 { font-size: 1.4rem; }
+  article h3 { font-size: 1.15rem; }
+  article p { margin: 0 0 1rem; }
+  article a { color: #7c3aed; text-decoration: underline; }
+  article a:hover { color: #6d28d9; }
+  article ul, article ol { margin: 0 0 1rem 1.5rem; }
+  article li { margin-bottom: 0.25rem; }
+  article blockquote {
+    border-left: 4px solid #d4d4d4;
+    margin: 1rem 0;
+    padding: 0.25rem 1rem;
+    color: #555;
+    font-style: italic;
+  }
+  article code {
+    background: #f0efe9;
+    padding: 0.15em 0.4em;
+    border-radius: 4px;
+    font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+    font-size: 0.875em;
+  }
+  article pre {
+    background: #1e1e2e;
+    color: #cdd6f4;
+    border-radius: 8px;
+    padding: 1.25rem;
+    overflow-x: auto;
+    margin: 1rem 0;
+  }
+  article pre code {
+    background: none;
+    padding: 0;
+    color: inherit;
+    font-size: 0.875rem;
+  }
+  article table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1rem 0;
+    font-size: 0.9rem;
+  }
+  article th, article td {
+    border: 1px solid #e5e5e5;
+    padding: 0.5rem 0.75rem;
+    text-align: left;
+  }
+  article th { background: #f0efe9; font-weight: 600; }
+  article img { max-width: 100%; border-radius: 6px; }
+  article hr { border: none; border-top: 1px solid #e5e5e5; margin: 2rem 0; }
+  footer {
+    margin-top: 3rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid #e5e5e5;
+    text-align: center;
+    color: #9ca3af;
+    font-size: 0.8rem;
+  }
+  @media (max-width: 600px) {
+    body { padding: 1.25rem 1rem 3rem; }
+    header h1 { font-size: 1.5rem; }
+  }
+`;
+
+// ─── HTML Sanitizer (allowlist-based) ─────────────────────────────────────────
+
+/** Allowed tags and their permitted attributes. Everything else is stripped. */
+const ALLOWED_TAGS: Record<string, Set<string>> = {
+  // Block
+  h1: new Set(),
+  h2: new Set(),
+  h3: new Set(),
+  h4: new Set(),
+  h5: new Set(),
+  h6: new Set(),
+  p: new Set(),
+  blockquote: new Set(),
+  pre: new Set(),
+  hr: new Set(),
+  br: new Set(),
+  div: new Set(),
+  // Inline
+  a: new Set(["href", "title", "rel"]),
+  strong: new Set(),
+  b: new Set(),
+  em: new Set(),
+  i: new Set(),
+  code: new Set(["class"]),
+  del: new Set(),
+  s: new Set(),
+  mark: new Set(),
+  sub: new Set(),
+  sup: new Set(),
+  span: new Set(),
+  // Lists
+  ul: new Set(),
+  ol: new Set(["start"]),
+  li: new Set(),
+  // Tables
+  table: new Set(),
+  thead: new Set(),
+  tbody: new Set(),
+  tr: new Set(),
+  th: new Set(["align"]),
+  td: new Set(["align"]),
+  // Media
+  img: new Set(["src", "alt", "title", "width", "height"]),
+  // Definition lists
+  dl: new Set(),
+  dt: new Set(),
+  dd: new Set(),
+};
+
+/** Attributes whose values must be checked for safe URL schemes. */
+const URL_ATTRS = new Set(["href", "src"]);
+const SAFE_URL_RE = /^(?:https?:\/\/|mailto:|#|\/)/i;
+
+/**
+ * Allowlist-based HTML sanitizer for CF Workers (no DOM required).
+ * Parses tags with a regex, keeps only allowed tags/attributes, and ensures
+ * URL attributes use safe schemes (http, https, mailto, fragment, relative).
+ */
+function sanitizeHtml(html: string): string {
+  return html.replace(
+    /<\/?([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)\/?>|<!--[\s\S]*?-->/g,
+    (match, tagName?: string, attrStr?: string) => {
+      // Strip HTML comments
+      if (match.startsWith("<!--")) return "";
+      if (!tagName) return "";
+
+      const tag = tagName.toLowerCase();
+      const allowedAttrs = ALLOWED_TAGS[tag];
+
+      // Tag not in allowlist → strip it entirely
+      if (!allowedAttrs) return "";
+
+      // Closing tag
+      if (match.startsWith("</")) return `</${tag}>`;
+
+      // Opening tag — filter attributes through allowlist
+      const attrs: string[] = [];
+      const attrRe = /([a-zA-Z_][\w-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|(\S+))/g;
+      let m: RegExpExecArray | null;
+      while ((m = attrRe.exec(attrStr ?? "")) !== null) {
+        const name = m[1].toLowerCase();
+        const value = m[2] ?? m[3] ?? m[4] ?? "";
+        if (!allowedAttrs.has(name)) continue;
+        if (URL_ATTRS.has(name) && !SAFE_URL_RE.test(value.trim())) continue;
+        attrs.push(`${name}="${escAttr(value)}"`);
+      }
+
+      const selfClosing = tag === "br" || tag === "hr" || tag === "img";
+      const attrString = attrs.length > 0 ? " " + attrs.join(" ") : "";
+      return selfClosing ? `<${tag}${attrString} />` : `<${tag}${attrString}>`;
+    },
+  );
+}
+
+/** Escape a string for use inside an HTML attribute value. */
+function escAttr(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+// ─── HTML Templates ────────────────────────────────────────────────────────────
+
+function escHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function notePage(title: string, dateStr: string, body: string): string {
+  const date = new Date(dateStr).toLocaleDateString("en-US", {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  });
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escHtml(title)}</title>
+  <style>${CSS}</style>
+</head>
+<body>
+  <header>
+    <h1>${escHtml(title)}</h1>
+    <div class="meta">Published ${date}</div>
+  </header>
+  <article>${body}</article>
+  <footer>Shared via Giskard 🔮</footer>
+</body>
+</html>`;
+}
+
+function page404(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Not Found</title>
+  <style>${CSS}
+    .center { text-align: center; padding: 4rem 0; }
+    .center h1 { font-size: 4rem; margin-bottom: 0.5rem; color: #d4d4d4; }
+    .center p { color: #6b6b6b; }
+  </style>
+</head>
+<body>
+  <div class="center">
+    <h1>404</h1>
+    <p>This note doesn't exist or hasn't been published.</p>
+  </div>
+  <footer>Shared via Giskard 🔮</footer>
+</body>
+</html>`;
+}
+
+// ─── Obsidian Redirect (original) ─────────────────────────────────────────────
+
+const obsidianRedirectPage = (obsidianUrl: string) => `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -29,42 +306,245 @@ const HTML = (obsidianUrl: string) => `<!DOCTYPE html>
   <p>Tap the button if Obsidian doesn't open automatically.</p>
   <a href="${obsidianUrl}">Open in Obsidian →</a>
   <script>
-    // Works in real browsers (macOS desktop); often blocked in Telegram WKWebView.
-    // Button above is the reliable fallback for iOS.
     try { window.location.href = ${JSON.stringify(obsidianUrl)}; } catch (e) {}
   </script>
 </body>
 </html>`;
 
+// ─── API Helpers ──────────────────────────────────────────────────────────────
+
+function unauthorized(): Response {
+  return new Response(JSON.stringify({ error: "Unauthorized" }), {
+    status: 401,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function json(
+  data: unknown,
+  status = 200,
+  extraHeaders?: Record<string, string>,
+): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json", ...extraHeaders },
+  });
+}
+
+/** Constant-time string comparison to prevent timing attacks. */
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) {
+    // Compare b against itself to keep constant time, then return false
+    const dummy = new TextEncoder().encode(b);
+    crypto.subtle.timingSafeEqual(dummy, dummy);
+    return false;
+  }
+  const encodedA = new TextEncoder().encode(a);
+  const encodedB = new TextEncoder().encode(b);
+  return crypto.subtle.timingSafeEqual(encodedA, encodedB);
+}
+
+function checkToken(req: Request, env: Env): boolean {
+  const token = req.headers.get("X-Publish-Token") ?? "";
+  return timingSafeEqual(token, env.PUBLISH_TOKEN);
+}
+
+function isValidSlug(slug: string): boolean {
+  return slug.length > 0 && slug.length <= 128 && SLUG_RE.test(slug);
+}
+
+// ─── Metadata Index Helpers ───────────────────────────────────────────────────
+
+async function getMetaIndex(env: Env): Promise<NoteMetaEntry[]> {
+  const raw = await env.PUBLISHED_NOTES.get(META_INDEX_KEY);
+  if (!raw) return [];
+  return JSON.parse(raw) as NoteMetaEntry[];
+}
+
+async function putMetaIndex(env: Env, entries: NoteMetaEntry[]): Promise<void> {
+  await env.PUBLISHED_NOTES.put(META_INDEX_KEY, JSON.stringify(entries));
+}
+
+// ─── Route Handlers ───────────────────────────────────────────────────────────
+
+async function handlePublicNote(slug: string, env: Env): Promise<Response> {
+  const raw = await env.PUBLISHED_NOTES.get(slug);
+  if (!raw) {
+    return new Response(page404(), {
+      status: 404,
+      headers: { "Content-Type": "text/html; charset=utf-8" },
+    });
+  }
+  const note: NoteRecord = JSON.parse(raw);
+  const rawHtml = await marked(note.markdown, { async: true });
+  const safeHtml = sanitizeHtml(rawHtml);
+  return new Response(notePage(note.title, note.publishedAt, safeHtml), {
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "public, max-age=300",
+    },
+  });
+}
+
+async function handlePutPublish(req: Request, env: Env): Promise<Response> {
+  if (!checkToken(req, env)) return unauthorized();
+
+  // Check body size via Content-Length header
+  const contentLength = req.headers.get("Content-Length");
+  if (contentLength && parseInt(contentLength, 10) > MAX_BODY_SIZE) {
+    return json({ error: "Request body too large (max 1MB)" }, 413);
+  }
+
+  // Parse JSON with error handling (#1 — blocker)
+  let body: { slug?: string; title?: string; markdown?: string };
+  try {
+    body = await req.json();
+  } catch {
+    return json({ error: "Invalid JSON" }, 400);
+  }
+
+  if (!body.slug || !body.title || !body.markdown) {
+    return json({ error: "slug, title, and markdown are required" }, 400);
+  }
+
+  // Validate field sizes after parsing (Content-Length is spoofable)
+  if (body.markdown.length > MAX_MARKDOWN_SIZE) {
+    return json({ error: "Markdown too large (max 512KB)" }, 413);
+  }
+  if (body.title.length > MAX_TITLE_SIZE) {
+    return json({ error: "Title too large (max 1KB)" }, 413);
+  }
+
+  // Validate slug (#3 — warning)
+  if (!isValidSlug(body.slug)) {
+    return json(
+      {
+        error:
+          "Invalid slug: only lowercase letters, numbers, and hyphens allowed (a-z0-9-), max 128 chars",
+      },
+      400,
+    );
+  }
+
+  const existing = await env.PUBLISHED_NOTES.get(body.slug);
+  const now = new Date().toISOString();
+  const record: NoteRecord = {
+    title: body.title,
+    markdown: body.markdown,
+    publishedAt: existing
+      ? (JSON.parse(existing) as NoteRecord).publishedAt
+      : now,
+    updatedAt: now,
+  };
+  await env.PUBLISHED_NOTES.put(body.slug, JSON.stringify(record));
+
+  // Update metadata index (#5 — N+1 fix)
+  const meta = await getMetaIndex(env);
+  const idx = meta.findIndex((e) => e.slug === body.slug);
+  const entry: NoteMetaEntry = {
+    slug: body.slug!,
+    title: body.title!,
+    publishedAt: record.publishedAt,
+    updatedAt: now,
+  };
+  if (idx >= 0) {
+    meta[idx] = entry;
+  } else {
+    meta.push(entry);
+  }
+  await putMetaIndex(env, meta);
+
+  return json({ ok: true, slug: body.slug, url: `/s/${body.slug}` });
+}
+
+async function handleDeletePublish(
+  slug: string,
+  req: Request,
+  env: Env,
+): Promise<Response> {
+  if (!checkToken(req, env)) return unauthorized();
+
+  if (!isValidSlug(slug)) {
+    return json({ error: "Invalid slug" }, 400);
+  }
+
+  await env.PUBLISHED_NOTES.delete(slug);
+
+  // Update metadata index
+  const meta = await getMetaIndex(env);
+  const filtered = meta.filter((e) => e.slug !== slug);
+  await putMetaIndex(env, filtered);
+
+  return json({ ok: true, slug });
+}
+
+async function handleListPublished(req: Request, env: Env): Promise<Response> {
+  if (!checkToken(req, env)) return unauthorized();
+
+  // Single KV read from metadata index instead of N+1 (#5)
+  const meta = await getMetaIndex(env);
+  return json({ notes: meta });
+}
+
+// ─── Main Fetch ───────────────────────────────────────────────────────────────
+
 export default {
-  fetch(req: Request): Response {
+  async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
+    const { pathname } = url;
 
     // Health check
-    if (url.pathname === "/health") {
+    if (pathname === "/health") {
       return new Response("ok", { headers: { "Content-Type": "text/plain" } });
     }
 
-    let obsidianUrl: string;
-
-    // Passthrough mode: /open?vault=X&file=Y → obsidian://open?vault=X&file=Y
-    if (url.pathname === "/open") {
-      obsidianUrl = `obsidian://open${url.search}`;
-    } else {
-      // Shorthand mode: /<vault>/<file-path> → obsidian://open?vault=<vault>&file=<file-path>
-      const match = url.pathname.match(/^\/([^/]+)\/(.+)$/);
-      if (!match) {
-        return new Response(
-          "Usage: /VaultName/path%2Fto%2Ffile  or  /open?vault=X&file=Y",
-          { status: 400, headers: { "Content-Type": "text/plain" } }
-        );
-      }
-      const [, vault, file] = match;
-      obsidianUrl = `obsidian://open?vault=${encodeURIComponent(vault)}&file=${file}`;
+    // Public note view: GET /s/<slug> (slug validated in regex)
+    const shareMatch = pathname.match(/^\/s\/([a-z0-9-]+)$/);
+    if (shareMatch && req.method === "GET") {
+      return handlePublicNote(shareMatch[1], env);
     }
 
-    return new Response(HTML(obsidianUrl), {
-      headers: { "Content-Type": "text/html; charset=utf-8" },
-    });
+    // Management API
+    if (pathname === "/api/publish" && req.method === "PUT") {
+      return handlePutPublish(req, env);
+    }
+    const deleteMatch = pathname.match(/^\/api\/publish\/([a-z0-9-]+)$/);
+    if (deleteMatch && req.method === "DELETE") {
+      return handleDeletePublish(deleteMatch[1], req, env);
+    }
+    if (pathname === "/api/published" && req.method === "GET") {
+      return handleListPublished(req, env);
+    }
+
+    // Defensive: reject unmatched /api/ and /s/ paths (#10)
+    if (pathname.startsWith("/api/") || pathname.startsWith("/s/")) {
+      return new Response(page404(), {
+        status: 404,
+        headers: { "Content-Type": "text/html; charset=utf-8" },
+      });
+    }
+
+    // Obsidian redirect: /open?vault=X&file=Y
+    if (pathname === "/open") {
+      const obsidianUrl = `obsidian://open${url.search}`;
+      return new Response(obsidianRedirectPage(obsidianUrl), {
+        headers: { "Content-Type": "text/html; charset=utf-8" },
+      });
+    }
+
+    // Obsidian redirect: /VaultName/path%2Fto%2Ffile
+    const vaultMatch = pathname.match(/^\/([^/]+)\/(.+)$/);
+    if (vaultMatch) {
+      const [, vault, file] = vaultMatch;
+      const obsidianUrl = `obsidian://open?vault=${encodeURIComponent(vault)}&file=${file}`;
+      return new Response(obsidianRedirectPage(obsidianUrl), {
+        headers: { "Content-Type": "text/html; charset=utf-8" },
+      });
+    }
+
+    return new Response(
+      "Usage: /VaultName/path%2Fto%2Ffile  or  /open?vault=X&file=Y  or  /s/<slug>",
+      { status: 400, headers: { "Content-Type": "text/plain" } },
+    );
   },
 };

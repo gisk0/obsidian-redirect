@@ -9,6 +9,7 @@ Get your own instance running in ~5 minutes:
 1. **Fork** [gisk0/obsidian-redirect](https://github.com/gisk0/obsidian-redirect)
 
 2. **Configure your domain** — edit `wrangler.toml`:
+
    ```toml
    routes = [
      { pattern = "obs.yourdomain.com/*", zone_name = "yourdomain.com" }
@@ -16,6 +17,7 @@ Get your own instance running in ~5 minutes:
    ```
 
 3. **Deploy:**
+
    ```bash
    npm install
    npx wrangler login        # authenticate with Cloudflare
@@ -32,6 +34,7 @@ Get your own instance running in ~5 minutes:
 After the first manual deploy, pushes to `main` auto-deploy via GitHub Actions.
 
 Add one GitHub secret: **`CF_API_TOKEN`**
+
 - Create at [Cloudflare → Profile → API Tokens](https://dash.cloudflare.com/profile/api-tokens)
 - Template: **Edit Cloudflare Workers**
 - Scope: Account → Workers Scripts → Edit
@@ -83,10 +86,10 @@ GET /health  →  200 "ok"
 - A **"Open in Obsidian →" button** — user-initiated taps pass WKWebView's security checks (iOS)
 - A **JS auto-redirect** — fires immediately on macOS/desktop browsers for zero-friction UX
 
-| Platform | Experience |
-|---|---|
-| **macOS** | Click link → browser flashes → Obsidian opens instantly |
-| **iOS** | Tap link → see "Open in Obsidian" page → tap button → Obsidian opens |
+| Platform  | Experience                                                           |
+| --------- | -------------------------------------------------------------------- |
+| **macOS** | Click link → browser flashes → Obsidian opens instantly              |
+| **iOS**   | Tap link → see "Open in Obsidian" page → tap button → Obsidian opens |
 
 The extra tap on iOS is unavoidable — it's a WKWebView security constraint. The button approach is the most reliable method available (Obsidian doesn't support Universal Links).
 

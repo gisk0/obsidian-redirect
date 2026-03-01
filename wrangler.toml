@@ -2,6 +2,12 @@ name = "obsidian-redirect"
 main = "src/index.ts"
 compatibility_date = "2024-01-01"
 
-routes = [
-  { pattern = "obs.gisk0.dev/*", zone_name = "gisk0.dev" }
-]
+routes = [{ pattern = "obs.gisk0.dev/*", zone_name = "gisk0.dev" }]
+
+## KV namespace ID — Terraform is the source of truth.
+## This value must match `cloudflare_workers_kv_namespace.published_notes.id`
+## from terraform/main.tf. After `tofu apply`, get it via:
+##   tofu -chdir=terraform output -raw kv_namespace_id
+[[kv_namespaces]]
+binding = "PUBLISHED_NOTES"
+id = "cf83f0a936324351985100e78363da07"

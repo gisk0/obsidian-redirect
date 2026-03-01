@@ -1,0 +1,54 @@
+name: Quality Checks
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  trunk:
+    name: Trunk Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: trunk-io/trunk-action@v1
+
+  build:
+    name: Build & Typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: worker-dist
+          path: dist/
+          retention-days: 1
+
+  terraform:
+    name: Terraform Validate
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: worker-dist
+          path: dist
+      - uses: opentofu/setup-opentofu@v1
+      - working-directory: terraform
+        run: tofu init -backend=false
+      - working-directory: terraform
+        run: tofu fmt -check
+      - working-directory: terraform
+        run: tofu validate
