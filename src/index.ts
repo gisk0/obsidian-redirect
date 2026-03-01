@@ -12,6 +12,19 @@ interface NoteRecord {
   updatedAt: string;
 }
 
+interface NoteMetaEntry {
+  slug: string;
+  title: string;
+  publishedAt: string;
+  updatedAt: string;
+}
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const MAX_BODY_SIZE = 1024 * 1024; // 1 MB
+const SLUG_RE = /^[a-z0-9][a-z0-9-]*$/;
+const META_INDEX_KEY = "_meta:index";
+
 // ─── CSS ──────────────────────────────────────────────────────────────────────
 
 const CSS = `
@@ -95,6 +108,34 @@ const CSS = `
     header h1 { font-size: 1.5rem; }
   }
 `;
+
+// ─── HTML Sanitizer ───────────────────────────────────────────────────────────
+
+/**
+ * Strip dangerous HTML from marked output. Removes script/iframe/object/embed/form
+ * tags and their content, event handler attributes (on*), and javascript:/vbscript:/data: URLs.
+ * Lightweight alternative to DOMPurify that works in CF Workers without DOM.
+ */
+function sanitizeHtml(html: string): string {
+  // Remove dangerous tags and their content
+  let clean = html.replace(
+    /<\s*(script|iframe|object|embed|form|applet|base)\b[^>]*>[\s\S]*?<\s*\/\s*\1\s*>/gi,
+    "",
+  );
+  // Remove self-closing / unclosed dangerous tags
+  clean = clean.replace(
+    /<\s*(script|iframe|object|embed|form|applet|base)\b[^>]*\/?>/gi,
+    "",
+  );
+  // Remove event handler attributes (on*)
+  clean = clean.replace(/\s+on\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "");
+  // Remove javascript: / vbscript: / data: URLs in href/src/action attributes
+  clean = clean.replace(
+    /(href|src|action)\s*=\s*(?:"[^"]*(?:javascript|vbscript|data)\s*:[^"]*"|'[^']*(?:javascript|vbscript|data)\s*:[^']*')/gi,
+    "",
+  );
+  return clean;
+}
 
 // ─── HTML Templates ────────────────────────────────────────────────────────────
 
@@ -201,15 +242,31 @@ function unauthorized(): Response {
   });
 }
 
-function json(data: unknown, status = 200): Response {
+function json(data: unknown, status = 200, extraHeaders?: Record<string, string>): Response {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...extraHeaders },
   });
 }
 
 function checkToken(req: Request, env: Env): boolean {
   return req.headers.get("X-Publish-Token") === env.PUBLISH_TOKEN;
+}
+
+function isValidSlug(slug: string): boolean {
+  return slug.length > 0 && slug.length <= 128 && SLUG_RE.test(slug);
+}
+
+// ─── Metadata Index Helpers ───────────────────────────────────────────────────
+
+async function getMetaIndex(env: Env): Promise<NoteMetaEntry[]> {
+  const raw = await env.PUBLISHED_NOTES.get(META_INDEX_KEY);
+  if (!raw) return [];
+  return JSON.parse(raw) as NoteMetaEntry[];
+}
+
+async function putMetaIndex(env: Env, entries: NoteMetaEntry[]): Promise<void> {
+  await env.PUBLISHED_NOTES.put(META_INDEX_KEY, JSON.stringify(entries));
 }
 
 // ─── Route Handlers ───────────────────────────────────────────────────────────
@@ -223,18 +280,45 @@ async function handlePublicNote(slug: string, env: Env): Promise<Response> {
     });
   }
   const note: NoteRecord = JSON.parse(raw);
-  const html = await marked(note.markdown, { async: true });
-  return new Response(notePage(note.title, note.publishedAt, html), {
-    headers: { "Content-Type": "text/html; charset=utf-8" },
+  const rawHtml = await marked(note.markdown, { async: true });
+  const safeHtml = sanitizeHtml(rawHtml);
+  return new Response(notePage(note.title, note.publishedAt, safeHtml), {
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "public, max-age=300",
+    },
   });
 }
 
 async function handlePutPublish(req: Request, env: Env): Promise<Response> {
   if (!checkToken(req, env)) return unauthorized();
-  const body = await req.json<{ slug: string; title: string; markdown: string }>();
+
+  // Check body size via Content-Length header
+  const contentLength = req.headers.get("Content-Length");
+  if (contentLength && parseInt(contentLength, 10) > MAX_BODY_SIZE) {
+    return json({ error: "Request body too large (max 1MB)" }, 413);
+  }
+
+  // Parse JSON with error handling (#1 — blocker)
+  let body: { slug?: string; title?: string; markdown?: string };
+  try {
+    body = await req.json();
+  } catch {
+    return json({ error: "Invalid JSON" }, 400);
+  }
+
   if (!body.slug || !body.title || !body.markdown) {
     return json({ error: "slug, title, and markdown are required" }, 400);
   }
+
+  // Validate slug (#3 — warning)
+  if (!isValidSlug(body.slug)) {
+    return json(
+      { error: "Invalid slug: only lowercase letters, numbers, and hyphens allowed (a-z0-9-), max 128 chars" },
+      400,
+    );
+  }
+
   const existing = await env.PUBLISHED_NOTES.get(body.slug);
   const now = new Date().toISOString();
   const record: NoteRecord = {
@@ -244,32 +328,49 @@ async function handlePutPublish(req: Request, env: Env): Promise<Response> {
     updatedAt: now,
   };
   await env.PUBLISHED_NOTES.put(body.slug, JSON.stringify(record));
+
+  // Update metadata index (#5 — N+1 fix)
+  const meta = await getMetaIndex(env);
+  const idx = meta.findIndex((e) => e.slug === body.slug);
+  const entry: NoteMetaEntry = {
+    slug: body.slug!,
+    title: body.title!,
+    publishedAt: record.publishedAt,
+    updatedAt: now,
+  };
+  if (idx >= 0) {
+    meta[idx] = entry;
+  } else {
+    meta.push(entry);
+  }
+  await putMetaIndex(env, meta);
+
   return json({ ok: true, slug: body.slug, url: `/s/${body.slug}` });
 }
 
 async function handleDeletePublish(slug: string, req: Request, env: Env): Promise<Response> {
   if (!checkToken(req, env)) return unauthorized();
+
+  if (!isValidSlug(slug)) {
+    return json({ error: "Invalid slug" }, 400);
+  }
+
   await env.PUBLISHED_NOTES.delete(slug);
+
+  // Update metadata index
+  const meta = await getMetaIndex(env);
+  const filtered = meta.filter((e) => e.slug !== slug);
+  await putMetaIndex(env, filtered);
+
   return json({ ok: true, slug });
 }
 
 async function handleListPublished(req: Request, env: Env): Promise<Response> {
   if (!checkToken(req, env)) return unauthorized();
-  const list = await env.PUBLISHED_NOTES.list();
-  const results = await Promise.all(
-    list.keys.map(async (k) => {
-      const raw = await env.PUBLISHED_NOTES.get(k.name);
-      if (!raw) return null;
-      const note: NoteRecord = JSON.parse(raw);
-      return {
-        slug: k.name,
-        title: note.title,
-        publishedAt: note.publishedAt,
-        updatedAt: note.updatedAt,
-      };
-    })
-  );
-  return json({ notes: results.filter(Boolean) });
+
+  // Single KV read from metadata index instead of N+1 (#5)
+  const meta = await getMetaIndex(env);
+  return json({ notes: meta });
 }
 
 // ─── Main Fetch ───────────────────────────────────────────────────────────────
@@ -284,8 +385,8 @@ export default {
       return new Response("ok", { headers: { "Content-Type": "text/plain" } });
     }
 
-    // Public note view: GET /s/<slug>
-    const shareMatch = pathname.match(/^\/s\/([^/]+)$/);
+    // Public note view: GET /s/<slug> (slug validated in regex)
+    const shareMatch = pathname.match(/^\/s\/([a-z0-9-]+)$/);
     if (shareMatch && req.method === "GET") {
       return handlePublicNote(shareMatch[1], env);
     }
@@ -294,12 +395,20 @@ export default {
     if (pathname === "/api/publish" && req.method === "PUT") {
       return handlePutPublish(req, env);
     }
-    const deleteMatch = pathname.match(/^\/api\/publish\/([^/]+)$/);
+    const deleteMatch = pathname.match(/^\/api\/publish\/([a-z0-9-]+)$/);
     if (deleteMatch && req.method === "DELETE") {
       return handleDeletePublish(deleteMatch[1], req, env);
     }
     if (pathname === "/api/published" && req.method === "GET") {
       return handleListPublished(req, env);
+    }
+
+    // Defensive: reject unmatched /api/ and /s/ paths (#10)
+    if (pathname.startsWith("/api/") || pathname.startsWith("/s/")) {
+      return new Response(page404(), {
+        status: 404,
+        headers: { "Content-Type": "text/html; charset=utf-8" },
+      });
     }
 
     // Obsidian redirect: /open?vault=X&file=Y
@@ -322,7 +431,7 @@ export default {
 
     return new Response(
       "Usage: /VaultName/path%2Fto%2Ffile  or  /open?vault=X&file=Y  or  /s/<slug>",
-      { status: 400, headers: { "Content-Type": "text/plain" } }
+      { status: 400, headers: { "Content-Type": "text/plain" } },
     );
   },
 };

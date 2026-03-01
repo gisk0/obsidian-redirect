@@ -1,13 +1,13 @@
 variable "account_id" {
   description = "Cloudflare account ID"
   type        = string
-  default     = "8a85c2c4aef344232708c5b962fdaf78"
+  # Set via terraform.tfvars (gitignored) or TF_VAR_account_id
 }
 
 variable "zone_id" {
   description = "Cloudflare zone ID for gisk0.dev"
   type        = string
-  default     = "2909c763f12cb23ad4c40f40f131b747"
+  # Set via terraform.tfvars (gitignored) or TF_VAR_zone_id
 }
 
 variable "publish_token" {
