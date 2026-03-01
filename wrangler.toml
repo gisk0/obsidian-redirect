@@ -5,3 +5,7 @@ compatibility_date = "2024-01-01"
 routes = [
   { pattern = "obs.gisk0.dev/*", zone_name = "gisk0.dev" }
 ]
+
+[[kv_namespaces]]
+binding = "PUBLISHED_NOTES"
+id = "cf83f0a936324351985100e78363da07"
