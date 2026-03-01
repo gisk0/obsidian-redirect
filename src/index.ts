@@ -22,6 +22,8 @@ interface NoteMetaEntry {
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const MAX_BODY_SIZE = 1024 * 1024; // 1 MB
+const MAX_MARKDOWN_SIZE = 512 * 1024; // 512 KB
+const MAX_TITLE_SIZE = 1024; // 1 KB
 const SLUG_RE = /^[a-z0-9][a-z0-9-]*$/;
 const META_INDEX_KEY = "_meta:index";
 
@@ -109,32 +111,107 @@ const CSS = `
   }
 `;
 
-// ─── HTML Sanitizer ───────────────────────────────────────────────────────────
+// ─── HTML Sanitizer (allowlist-based) ─────────────────────────────────────────
+
+/** Allowed tags and their permitted attributes. Everything else is stripped. */
+const ALLOWED_TAGS: Record<string, Set<string>> = {
+  // Block
+  h1: new Set(),
+  h2: new Set(),
+  h3: new Set(),
+  h4: new Set(),
+  h5: new Set(),
+  h6: new Set(),
+  p: new Set(),
+  blockquote: new Set(),
+  pre: new Set(),
+  hr: new Set(),
+  br: new Set(),
+  div: new Set(),
+  // Inline
+  a: new Set(["href", "title", "rel"]),
+  strong: new Set(),
+  b: new Set(),
+  em: new Set(),
+  i: new Set(),
+  code: new Set(["class"]),
+  del: new Set(),
+  s: new Set(),
+  mark: new Set(),
+  sub: new Set(),
+  sup: new Set(),
+  span: new Set(),
+  // Lists
+  ul: new Set(),
+  ol: new Set(["start"]),
+  li: new Set(),
+  // Tables
+  table: new Set(),
+  thead: new Set(),
+  tbody: new Set(),
+  tr: new Set(),
+  th: new Set(["align"]),
+  td: new Set(["align"]),
+  // Media
+  img: new Set(["src", "alt", "title", "width", "height"]),
+  // Definition lists
+  dl: new Set(),
+  dt: new Set(),
+  dd: new Set(),
+};
+
+/** Attributes whose values must be checked for safe URL schemes. */
+const URL_ATTRS = new Set(["href", "src"]);
+const SAFE_URL_RE = /^(?:https?:\/\/|mailto:|#|\/)/i;
 
 /**
- * Strip dangerous HTML from marked output. Removes script/iframe/object/embed/form
- * tags and their content, event handler attributes (on*), and javascript:/vbscript:/data: URLs.
- * Lightweight alternative to DOMPurify that works in CF Workers without DOM.
+ * Allowlist-based HTML sanitizer for CF Workers (no DOM required).
+ * Parses tags with a regex, keeps only allowed tags/attributes, and ensures
+ * URL attributes use safe schemes (http, https, mailto, fragment, relative).
  */
 function sanitizeHtml(html: string): string {
-  // Remove dangerous tags and their content
-  let clean = html.replace(
-    /<\s*(script|iframe|object|embed|form|applet|base)\b[^>]*>[\s\S]*?<\s*\/\s*\1\s*>/gi,
-    "",
+  return html.replace(
+    /<\/?([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)\/?>|<!--[\s\S]*?-->/g,
+    (match, tagName?: string, attrStr?: string) => {
+      // Strip HTML comments
+      if (match.startsWith("<!--")) return "";
+      if (!tagName) return "";
+
+      const tag = tagName.toLowerCase();
+      const allowedAttrs = ALLOWED_TAGS[tag];
+
+      // Tag not in allowlist → strip it entirely
+      if (!allowedAttrs) return "";
+
+      // Closing tag
+      if (match.startsWith("</")) return `</${tag}>`;
+
+      // Opening tag — filter attributes through allowlist
+      const attrs: string[] = [];
+      const attrRe = /([a-zA-Z_][\w-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|(\S+))/g;
+      let m: RegExpExecArray | null;
+      while ((m = attrRe.exec(attrStr ?? "")) !== null) {
+        const name = m[1].toLowerCase();
+        const value = m[2] ?? m[3] ?? m[4] ?? "";
+        if (!allowedAttrs.has(name)) continue;
+        if (URL_ATTRS.has(name) && !SAFE_URL_RE.test(value.trim())) continue;
+        attrs.push(`${name}="${escAttr(value)}"`);
+      }
+
+      const selfClosing = tag === "br" || tag === "hr" || tag === "img";
+      const attrString = attrs.length > 0 ? " " + attrs.join(" ") : "";
+      return selfClosing ? `<${tag}${attrString} />` : `<${tag}${attrString}>`;
+    },
   );
-  // Remove self-closing / unclosed dangerous tags
-  clean = clean.replace(
-    /<\s*(script|iframe|object|embed|form|applet|base)\b[^>]*\/?>/gi,
-    "",
-  );
-  // Remove event handler attributes (on*)
-  clean = clean.replace(/\s+on\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "");
-  // Remove javascript: / vbscript: / data: URLs in href/src/action attributes
-  clean = clean.replace(
-    /(href|src|action)\s*=\s*(?:"[^"]*(?:javascript|vbscript|data)\s*:[^"]*"|'[^']*(?:javascript|vbscript|data)\s*:[^']*')/gi,
-    "",
-  );
-  return clean;
+}
+
+/** Escape a string for use inside an HTML attribute value. */
+function escAttr(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
 // ─── HTML Templates ────────────────────────────────────────────────────────────
@@ -144,7 +221,8 @@ function escHtml(s: string): string {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function notePage(title: string, dateStr: string, body: string): string {
@@ -253,8 +331,22 @@ function json(
   });
 }
 
+/** Constant-time string comparison to prevent timing attacks. */
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) {
+    // Compare b against itself to keep constant time, then return false
+    const dummy = new TextEncoder().encode(b);
+    crypto.subtle.timingSafeEqual(dummy, dummy);
+    return false;
+  }
+  const encodedA = new TextEncoder().encode(a);
+  const encodedB = new TextEncoder().encode(b);
+  return crypto.subtle.timingSafeEqual(encodedA, encodedB);
+}
+
 function checkToken(req: Request, env: Env): boolean {
-  return req.headers.get("X-Publish-Token") === env.PUBLISH_TOKEN;
+  const token = req.headers.get("X-Publish-Token") ?? "";
+  return timingSafeEqual(token, env.PUBLISH_TOKEN);
 }
 
 function isValidSlug(slug: string): boolean {
@@ -313,6 +405,14 @@ async function handlePutPublish(req: Request, env: Env): Promise<Response> {
 
   if (!body.slug || !body.title || !body.markdown) {
     return json({ error: "slug, title, and markdown are required" }, 400);
+  }
+
+  // Validate field sizes after parsing (Content-Length is spoofable)
+  if (body.markdown.length > MAX_MARKDOWN_SIZE) {
+    return json({ error: "Markdown too large (max 512KB)" }, 413);
+  }
+  if (body.title.length > MAX_TITLE_SIZE) {
+    return json({ error: "Title too large (max 1KB)" }, 413);
   }
 
   // Validate slug (#3 — warning)

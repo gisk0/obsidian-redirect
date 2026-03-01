@@ -31,14 +31,14 @@ export TF_VAR_publish_token=$(pass obsidian-redirect/publish-token)
 
 # Import the KV namespace that already exists
 tofu import cloudflare_workers_kv_namespace.published_notes \
-  '8a85c2c4aef344232708c5b962fdaf78/cf83f0a936324351985100e78363da07'
+  '<your-account-id>/<your-kv-namespace-id>'
 
 # Import the worker route
 # First get the route ID:
-curl -s "https://api.cloudflare.com/client/v4/zones/2909c763f12cb23ad4c40f40f131b747/workers/routes" \
+curl -s "https://api.cloudflare.com/client/v4/zones/<your-zone-id>/workers/routes" \
   -H "Authorization: Bearer $(pass cloudflare/workers-api-token)" | python3 -m json.tool
 # Then:
-tofu import cloudflare_workers_route.obs_gisk0_dev '<zone_id>/<route_id>'
+tofu import cloudflare_workers_route.obs_gisk0_dev '<your-zone-id>/<route_id>'
 ```
 
 ## Workflow
