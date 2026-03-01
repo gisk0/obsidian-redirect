@@ -22,10 +22,14 @@ interface NoteMetaEntry {
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const MAX_BODY_SIZE = 1024 * 1024; // 1 MB
+const MAX_IMAGE_SIZE = 10 * 1024 * 1024; // 10 MB
 const MAX_MARKDOWN_SIZE = 512 * 1024; // 512 KB
 const MAX_TITLE_SIZE = 1024; // 1 KB
 const SLUG_RE = /^[a-z0-9][a-z0-9-]*$/;
+const FILENAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]*\.[a-zA-Z0-9]+$/;
 const META_INDEX_KEY = "_meta:index";
+const IMG_KEY_PREFIX = "img:";
+const IMG_META_PREFIX = "img-meta:";
 
 // ─── CSS ──────────────────────────────────────────────────────────────────────
 
@@ -376,7 +380,8 @@ async function handlePublicNote(slug: string, env: Env): Promise<Response> {
     });
   }
   const note: NoteRecord = JSON.parse(raw);
-  const rawHtml = await marked(note.markdown, { async: true });
+  const rewritten = rewriteImageUrls(note.markdown, slug);
+  const rawHtml = await marked(rewritten, { async: true });
   const safeHtml = sanitizeHtml(rawHtml);
   return new Response(notePage(note.title, note.publishedAt, safeHtml), {
     headers: {
@@ -470,6 +475,9 @@ async function handleDeletePublish(
 
   await env.PUBLISHED_NOTES.delete(slug);
 
+  // Delete all associated images
+  await deleteAllImages(env, slug);
+
   // Update metadata index
   const meta = await getMetaIndex(env);
   const filtered = meta.filter((e) => e.slug !== slug);
@@ -484,6 +492,265 @@ async function handleListPublished(req: Request, env: Env): Promise<Response> {
   // Single KV read from metadata index instead of N+1 (#5)
   const meta = await getMetaIndex(env);
   return json({ notes: meta });
+}
+
+// ─── Image Helpers ────────────────────────────────────────────────────────────
+
+interface ImageMeta {
+  filename: string;
+  contentType: string;
+  size: number;
+  uploadedAt: string;
+}
+
+function imgKey(slug: string, filename: string): string {
+  return `${IMG_KEY_PREFIX}${slug}/${filename}`;
+}
+
+function imgMetaKey(slug: string): string {
+  return `${IMG_META_PREFIX}${slug}`;
+}
+
+function isValidFilename(filename: string): boolean {
+  return (
+    filename.length > 0 && filename.length <= 255 && FILENAME_RE.test(filename)
+  );
+}
+
+const ALLOWED_CONTENT_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/gif",
+  "image/webp",
+  // SVG intentionally excluded — serving SVGs from the same origin enables XSS
+]);
+
+async function getImageMetas(env: Env, slug: string): Promise<ImageMeta[]> {
+  const raw = await env.PUBLISHED_NOTES.get(imgMetaKey(slug));
+  if (!raw) return [];
+  return JSON.parse(raw) as ImageMeta[];
+}
+
+async function putImageMetas(
+  env: Env,
+  slug: string,
+  metas: ImageMeta[],
+): Promise<void> {
+  if (metas.length === 0) {
+    await env.PUBLISHED_NOTES.delete(imgMetaKey(slug));
+  } else {
+    await env.PUBLISHED_NOTES.put(imgMetaKey(slug), JSON.stringify(metas));
+  }
+}
+
+// ─── Image Route Handlers ─────────────────────────────────────────────────────
+
+async function handlePutImage(req: Request, env: Env): Promise<Response> {
+  if (!checkToken(req, env)) return unauthorized();
+
+  const contentLength = req.headers.get("Content-Length");
+  if (contentLength && parseInt(contentLength, 10) > MAX_IMAGE_SIZE) {
+    return json({ error: "Image too large (max 10MB)" }, 413);
+  }
+
+  let slug: string;
+  let filename: string;
+  let data: ArrayBuffer;
+  let contentType: string;
+
+  // Support JSON body with base64-encoded image data.
+  // Note: base64 encoding adds ~33% overhead, so the effective max image size
+  // through this endpoint is ~7.5MB. Multipart upload could be a future
+  // improvement for larger files.
+  let body: {
+    slug?: string;
+    filename?: string;
+    data?: string;
+    contentType?: string;
+  };
+  try {
+    body = await req.json();
+  } catch {
+    return json({ error: "Invalid JSON" }, 400);
+  }
+
+  if (!body.slug || !body.filename || !body.data || !body.contentType) {
+    return json(
+      { error: "slug, filename, data (base64), and contentType are required" },
+      400,
+    );
+  }
+
+  slug = body.slug;
+  filename = body.filename;
+  contentType = body.contentType;
+
+  if (!isValidSlug(slug)) {
+    return json({ error: "Invalid slug" }, 400);
+  }
+  if (!isValidFilename(filename)) {
+    return json({ error: "Invalid filename" }, 400);
+  }
+
+  // Verify the note exists before accepting images (prevents orphaned images)
+  const noteExists = await env.PUBLISHED_NOTES.get(slug);
+  if (!noteExists) {
+    return json(
+      { error: "Note not found. Publish the note before uploading images." },
+      404,
+    );
+  }
+
+  if (!ALLOWED_CONTENT_TYPES.has(contentType)) {
+    return json(
+      {
+        error: `Invalid content type. Allowed: ${[...ALLOWED_CONTENT_TYPES].join(", ")}`,
+      },
+      400,
+    );
+  }
+
+  // Decode base64
+  try {
+    const binaryStr = atob(body.data);
+    const bytes = new Uint8Array(binaryStr.length);
+    for (let i = 0; i < binaryStr.length; i++) {
+      bytes[i] = binaryStr.charCodeAt(i);
+    }
+    data = bytes.buffer as ArrayBuffer;
+  } catch {
+    return json({ error: "Invalid base64 data" }, 400);
+  }
+
+  if (data.byteLength > MAX_IMAGE_SIZE) {
+    return json({ error: "Image too large (max 10MB)" }, 413);
+  }
+
+  // Store image binary in KV
+  await env.PUBLISHED_NOTES.put(imgKey(slug, filename), data, {
+    metadata: { contentType },
+  });
+
+  // Update image metadata list
+  // NOTE: This read-modify-write is not atomic. KV doesn't support transactions,
+  // so concurrent uploads for the same slug could lose metadata entries.
+  // Acceptable for now since publishes are single-user. If this becomes multi-user,
+  // consider a compare-and-swap retry loop or moving metadata to D1.
+  const metas = await getImageMetas(env, slug);
+  const now = new Date().toISOString();
+  const idx = metas.findIndex((m) => m.filename === filename);
+  const meta: ImageMeta = {
+    filename,
+    contentType,
+    size: data.byteLength,
+    uploadedAt: now,
+  };
+  if (idx >= 0) {
+    metas[idx] = meta;
+  } else {
+    metas.push(meta);
+  }
+  await putImageMetas(env, slug, metas);
+
+  return json({
+    ok: true,
+    slug,
+    filename,
+    url: `/s/${slug}/img/${filename}`,
+    size: data.byteLength,
+  });
+}
+
+async function handleServeImage(
+  slug: string,
+  filename: string,
+  env: Env,
+): Promise<Response> {
+  const result = await env.PUBLISHED_NOTES.getWithMetadata<{
+    contentType?: string;
+  }>(imgKey(slug, filename), { type: "arrayBuffer" });
+
+  if (!result.value) {
+    return new Response("Not found", { status: 404 });
+  }
+
+  const ct = result.metadata?.contentType ?? "application/octet-stream";
+  const bytes = result.value as ArrayBuffer;
+  return new Response(bytes, {
+    headers: {
+      "Content-Type": ct,
+      "Content-Length": String(bytes.byteLength),
+      "Cache-Control": "public, max-age=31536000, immutable",
+    },
+  });
+}
+
+async function handleDeleteImage(
+  slug: string,
+  filename: string,
+  req: Request,
+  env: Env,
+): Promise<Response> {
+  if (!checkToken(req, env)) return unauthorized();
+
+  if (!isValidSlug(slug) || !isValidFilename(filename)) {
+    return json({ error: "Invalid slug or filename" }, 400);
+  }
+
+  // Check if image exists before deleting
+  const existing = await env.PUBLISHED_NOTES.get(imgKey(slug, filename));
+  if (!existing) {
+    return json({ error: "Image not found" }, 404);
+  }
+
+  await env.PUBLISHED_NOTES.delete(imgKey(slug, filename));
+
+  // Update metadata
+  const metas = await getImageMetas(env, slug);
+  const filtered = metas.filter((m) => m.filename !== filename);
+  await putImageMetas(env, slug, filtered);
+
+  return json({ ok: true, slug, filename });
+}
+
+async function handleListImages(
+  slug: string,
+  req: Request,
+  env: Env,
+): Promise<Response> {
+  if (!checkToken(req, env)) return unauthorized();
+
+  if (!isValidSlug(slug)) {
+    return json({ error: "Invalid slug" }, 400);
+  }
+
+  const metas = await getImageMetas(env, slug);
+  return json({
+    slug,
+    images: metas.map((m) => ({
+      ...m,
+      url: `/s/${slug}/img/${m.filename}`,
+    })),
+  });
+}
+
+async function deleteAllImages(env: Env, slug: string): Promise<void> {
+  const metas = await getImageMetas(env, slug);
+  await Promise.all(
+    metas.map((m) => env.PUBLISHED_NOTES.delete(imgKey(slug, m.filename))),
+  );
+  await env.PUBLISHED_NOTES.delete(imgMetaKey(slug));
+}
+
+// ─── Markdown Image Rewriting ─────────────────────────────────────────────────
+
+function rewriteImageUrls(markdown: string, slug: string): string {
+  // Rewrite ![alt](img/filename) and ![alt](./img/filename) → ![alt](/s/<slug>/img/filename)
+  return markdown.replace(
+    /!\[([^\]]*)\]\((?:\.\/)?img\/([^)]+)\)/g,
+    (_match, alt: string, filename: string) =>
+      `![${alt}](/s/${slug}/img/${filename})`,
+  );
 }
 
 // ─── Main Fetch ───────────────────────────────────────────────────────────────
@@ -504,6 +771,14 @@ export default {
       return handlePublicNote(shareMatch[1], env);
     }
 
+    // Public image serving: GET /s/<slug>/img/<filename>
+    const imgMatch = pathname.match(
+      /^\/s\/([a-z0-9-]+)\/img\/([a-zA-Z0-9][a-zA-Z0-9._-]*\.[a-zA-Z0-9]+)$/,
+    );
+    if (imgMatch && req.method === "GET") {
+      return handleServeImage(imgMatch[1], imgMatch[2], env);
+    }
+
     // Management API
     if (pathname === "/api/publish" && req.method === "PUT") {
       return handlePutPublish(req, env);
@@ -514,6 +789,21 @@ export default {
     }
     if (pathname === "/api/published" && req.method === "GET") {
       return handleListPublished(req, env);
+    }
+
+    // Image API
+    if (pathname === "/api/image" && req.method === "PUT") {
+      return handlePutImage(req, env);
+    }
+    const deleteImgMatch = pathname.match(
+      /^\/api\/image\/([a-z0-9-]+)\/([a-zA-Z0-9][a-zA-Z0-9._-]*\.[a-zA-Z0-9]+)$/,
+    );
+    if (deleteImgMatch && req.method === "DELETE") {
+      return handleDeleteImage(deleteImgMatch[1], deleteImgMatch[2], req, env);
+    }
+    const listImgMatch = pathname.match(/^\/api\/images\/([a-z0-9-]+)$/);
+    if (listImgMatch && req.method === "GET") {
+      return handleListImages(listImgMatch[1], req, env);
     }
 
     // Defensive: reject unmatched /api/ and /s/ paths (#10)
