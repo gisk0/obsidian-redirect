@@ -242,7 +242,11 @@ function unauthorized(): Response {
   });
 }
 
-function json(data: unknown, status = 200, extraHeaders?: Record<string, string>): Response {
+function json(
+  data: unknown,
+  status = 200,
+  extraHeaders?: Record<string, string>,
+): Response {
   return new Response(JSON.stringify(data), {
     status,
     headers: { "Content-Type": "application/json", ...extraHeaders },
@@ -314,7 +318,10 @@ async function handlePutPublish(req: Request, env: Env): Promise<Response> {
   // Validate slug (#3 — warning)
   if (!isValidSlug(body.slug)) {
     return json(
-      { error: "Invalid slug: only lowercase letters, numbers, and hyphens allowed (a-z0-9-), max 128 chars" },
+      {
+        error:
+          "Invalid slug: only lowercase letters, numbers, and hyphens allowed (a-z0-9-), max 128 chars",
+      },
       400,
     );
   }
@@ -324,7 +331,9 @@ async function handlePutPublish(req: Request, env: Env): Promise<Response> {
   const record: NoteRecord = {
     title: body.title,
     markdown: body.markdown,
-    publishedAt: existing ? (JSON.parse(existing) as NoteRecord).publishedAt : now,
+    publishedAt: existing
+      ? (JSON.parse(existing) as NoteRecord).publishedAt
+      : now,
     updatedAt: now,
   };
   await env.PUBLISHED_NOTES.put(body.slug, JSON.stringify(record));
@@ -348,7 +357,11 @@ async function handlePutPublish(req: Request, env: Env): Promise<Response> {
   return json({ ok: true, slug: body.slug, url: `/s/${body.slug}` });
 }
 
-async function handleDeletePublish(slug: string, req: Request, env: Env): Promise<Response> {
+async function handleDeletePublish(
+  slug: string,
+  req: Request,
+  env: Env,
+): Promise<Response> {
   if (!checkToken(req, env)) return unauthorized();
 
   if (!isValidSlug(slug)) {

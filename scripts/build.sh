@@ -9,14 +9,15 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$REPO_ROOT"
+cd "${REPO_ROOT}"
 
 echo "Building worker bundle..."
 bun run wrangler deploy --dry-run --outdir=dist 2>&1
 
 if [[ ! -f dist/index.js ]]; then
-  echo "Error: dist/index.js not found after build" >&2
-  exit 1
+	echo "Error: dist/index.js not found after build" >&2
+	exit 1
 fi
 
-echo "✅ Built: dist/index.js ($(du -sh dist/index.js | cut -f1))"
+size="$(du -sh dist/index.js | cut -f1)"
+echo "✅ Built: dist/index.js (${size})"

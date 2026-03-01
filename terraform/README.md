@@ -4,11 +4,11 @@ All Cloudflare infrastructure for `obs.gisk0.dev` is managed here as code.
 
 ## What's managed
 
-| Resource | Terraform name | Notes |
-|---|---|---|
-| KV Namespace | `cloudflare_workers_kv_namespace.published_notes` | Stores published notes JSON |
-| Worker Script | `cloudflare_workers_script.obsidian_redirect` | Bundled TS worker |
-| Route | `cloudflare_workers_route.obs_gisk0_dev` | `obs.gisk0.dev/*` → worker |
+| Resource      | Terraform name                                    | Notes                       |
+| ------------- | ------------------------------------------------- | --------------------------- |
+| KV Namespace  | `cloudflare_workers_kv_namespace.published_notes` | Stores published notes JSON |
+| Worker Script | `cloudflare_workers_script.obsidian_redirect`     | Bundled TS worker           |
+| Route         | `cloudflare_workers_route.obs_gisk0_dev`          | `obs.gisk0.dev/*` → worker  |
 
 ## Prerequisites
 
@@ -58,10 +58,10 @@ make deploy
 
 Secrets are **never** hardcoded. They're read at plan/apply time:
 
-| Secret | Source | How used |
-|---|---|---|
-| `CLOUDFLARE_API_TOKEN` | `pass cloudflare/workers-api-token` | Terraform provider auth |
-| `PUBLISH_TOKEN` | `pass obsidian-redirect/publish-token` | Worker secret binding |
+| Secret                 | Source                                 | How used                |
+| ---------------------- | -------------------------------------- | ----------------------- |
+| `CLOUDFLARE_API_TOKEN` | `pass cloudflare/workers-api-token`    | Terraform provider auth |
+| `PUBLISH_TOKEN`        | `pass obsidian-redirect/publish-token` | Worker secret binding   |
 
 The `publish_token` variable is marked `sensitive = true` — it won't appear in plan output.
 
