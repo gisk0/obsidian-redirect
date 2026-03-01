@@ -522,7 +522,7 @@ const ALLOWED_CONTENT_TYPES = new Set([
   "image/png",
   "image/gif",
   "image/webp",
-  "image/svg+xml",
+  // SVG intentionally excluded — serving SVGs from the same origin enables XSS
 ]);
 
 async function getImageMetas(env: Env, slug: string): Promise<ImageMeta[]> {
@@ -558,7 +558,10 @@ async function handlePutImage(req: Request, env: Env): Promise<Response> {
   let data: ArrayBuffer;
   let contentType: string;
 
-  // Support JSON body with base64 data
+  // Support JSON body with base64-encoded image data.
+  // Note: base64 encoding adds ~33% overhead, so the effective max image size
+  // through this endpoint is ~7.5MB. Multipart upload could be a future
+  // improvement for larger files.
   let body: {
     slug?: string;
     filename?: string;
@@ -588,6 +591,16 @@ async function handlePutImage(req: Request, env: Env): Promise<Response> {
   if (!isValidFilename(filename)) {
     return json({ error: "Invalid filename" }, 400);
   }
+
+  // Verify the note exists before accepting images (prevents orphaned images)
+  const noteExists = await env.PUBLISHED_NOTES.get(slug);
+  if (!noteExists) {
+    return json(
+      { error: "Note not found. Publish the note before uploading images." },
+      404,
+    );
+  }
+
   if (!ALLOWED_CONTENT_TYPES.has(contentType)) {
     return json(
       {
@@ -619,6 +632,10 @@ async function handlePutImage(req: Request, env: Env): Promise<Response> {
   });
 
   // Update image metadata list
+  // NOTE: This read-modify-write is not atomic. KV doesn't support transactions,
+  // so concurrent uploads for the same slug could lose metadata entries.
+  // Acceptable for now since publishes are single-user. If this becomes multi-user,
+  // consider a compare-and-swap retry loop or moving metadata to D1.
   const metas = await getImageMetas(env, slug);
   const now = new Date().toISOString();
   const idx = metas.findIndex((m) => m.filename === filename);
@@ -658,9 +675,11 @@ async function handleServeImage(
   }
 
   const ct = result.metadata?.contentType ?? "application/octet-stream";
-  return new Response(result.value, {
+  const bytes = result.value as ArrayBuffer;
+  return new Response(bytes, {
     headers: {
       "Content-Type": ct,
+      "Content-Length": String(bytes.byteLength),
       "Cache-Control": "public, max-age=31536000, immutable",
     },
   });
@@ -676,6 +695,12 @@ async function handleDeleteImage(
 
   if (!isValidSlug(slug) || !isValidFilename(filename)) {
     return json({ error: "Invalid slug or filename" }, 400);
+  }
+
+  // Check if image exists before deleting
+  const existing = await env.PUBLISHED_NOTES.get(imgKey(slug, filename));
+  if (!existing) {
+    return json({ error: "Image not found" }, 404);
   }
 
   await env.PUBLISHED_NOTES.delete(imgKey(slug, filename));
@@ -720,9 +745,9 @@ async function deleteAllImages(env: Env, slug: string): Promise<void> {
 // ─── Markdown Image Rewriting ─────────────────────────────────────────────────
 
 function rewriteImageUrls(markdown: string, slug: string): string {
-  // Rewrite ![alt](img/filename) → ![alt](/s/<slug>/img/filename)
+  // Rewrite ![alt](img/filename) and ![alt](./img/filename) → ![alt](/s/<slug>/img/filename)
   return markdown.replace(
-    /!\[([^\]]*)\]\(img\/([^)]+)\)/g,
+    /!\[([^\]]*)\]\((?:\.\/)?img\/([^)]+)\)/g,
     (_match, alt: string, filename: string) =>
       `![${alt}](/s/${slug}/img/${filename})`,
   );
